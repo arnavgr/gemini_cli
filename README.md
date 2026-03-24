@@ -1,6 +1,6 @@
 # gemini-cli
 
-Gemini AI client for your terminal — written purely in bash for macOS/linux
+A fast, feature-rich Gemini AI client for macOS/linux written in bash
 
 ```
 $ gemini "explain how sed works"
@@ -10,7 +10,7 @@ sed (stream editor) processes text line by line using pattern-action rules...
   • -i edits files in-place
   • s/old/new/g is the substitution command
 
-[↑ 12 tokens  ↓ 184 tokens  •  gemini-3.0-flash]
+[↑ 12 tokens  ↓ 184 tokens  •  gemini-2.0-flash]
 ```
 
 ---
@@ -22,14 +22,14 @@ sed (stream editor) processes text line by line using pattern-action rules...
 curl -sL https://raw.githubusercontent.com/arnavgr/gemini-cli/main/install.sh | bash
 ```
 
-**Custom install prefix (no sudo needed):**
+**Custom install prefix (ensure it is in $PATH) (no sudo needed):**
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/gemini-cli/main/install.sh | bash -s -- --prefix ~/.local
+curl -sL https://raw.githubusercontent.com/arnavgr/gemini-cli/main/install.sh | bash -s -- --prefix ~/.local/bin
 ```
 
 **Manual:**
 ```bash
-git clone https://github.com/arnavgr/gemini-cli
+git clone https://github.com/YOUR_USERNAME/gemini-cli
 cd gemini-cli
 chmod +x gemini
 sudo mv gemini /usr/local/bin/gemini
@@ -60,7 +60,7 @@ On first run, gemini will ask you to paste your API key and save it automaticall
 
 Get a free key at: https://aistudio.google.com/app/apikey
 
-The key is stored in `~/.gemini_key` with `chmod 600`.  
+The key is stored in `~/.config/gemini/api_key` with `chmod 600`.  
 You can also set it as an environment variable (takes priority):
 
 ```bash
@@ -135,14 +135,24 @@ Sessions are stored in `~/.local/share/gemini/sessions/` as numbered JSON files 
 
 ```bash
 # Switch model (saved for future calls)
-gemini --model gemini-3.1-pro "explain quantum entanglement"
+gemini --model gemini-3.1-pro-preview "explain quantum entanglement"
 ```
+
+**Gemini 3 series** (preview — cutting edge)
 
 | Model | Speed | Best for |
 |-------|-------|----------|
-| `gemini-3.0-flash` | ⚡⚡⚡ | Default, everyday tasks |
-| `gemini-3.1-flash-lite` | ⚡⚡⚡⚡ | Fastest, simple queries |
-| `gemini-3.1-pro` | ⚡ | Complex reasoning, long context |
+| `gemini-3.1-pro-preview` | ⚡ | Hardest tasks, complex reasoning & coding |
+| `gemini-3-flash-preview` | ⚡⚡⚡ | Frontier-class at a fraction of the cost |
+| `gemini-3.1-flash-lite-preview` | ⚡⚡⚡⚡ | Fastest Gemini 3, budget-friendly |
+
+**Gemini 2.5 series** (stable — production ready)
+
+| Model | Speed | Best for |
+|-------|-------|----------|
+| `gemini-2.5-pro` | ⚡ | Best reasoning, 1M token context |
+| `gemini-2.5-flash` | ⚡⚡⚡ | Best price/performance — **default** |
+| `gemini-2.5-flash-lite` | ⚡⚡⚡⚡ | Fastest & cheapest of the 2.5 family |
 
 The selected model persists to `~/.config/gemini/config` — no need to repeat it.
 
@@ -193,7 +203,7 @@ You can edit this file directly. Currently supported keys: `model`.
 
 | Path | Purpose |
 |------|---------|
-| `~/.gemini_key` | API key (chmod 600) |
+| `~/.config/gemini/api_key` | API key (chmod 600) |
 | `~/.config/gemini/config` | Persistent settings |
 | `~/.local/share/gemini/sessions/` | Conversation history |
 
