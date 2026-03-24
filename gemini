@@ -1,0 +1,672 @@
+#!/bin/bash
+# =============================================================================
+#  gemini_cli - runs gemini AI in yout terminal
+# =============================================================================
+
+VERSION="0.1.0"
+REPO="arnavgr/gemini_cli"          
+RAW_URL="https://raw.githubusercontent.com/${REPO}/main/gemini"
+
+MODEL_DEFAULT="gemini-2.5-flash"
+KEY_FILE="$HOME/.config/gemini/api_key"
+CONFIG_FILE="$HOME/.config/gemini/config"
+SESSIONS_DIR="$HOME/.local/share/gemini/sessions"
+SESSIONS_INDEX="$SESSIONS_DIR/.index"    # maps numbers → names
+
+# --- Runtime state -----------------------------------------------------------
+MODEL=""
+SESSION="default"
+RAW=false
+SYSTEM_PROMPT=""
+STDIN_CONTENT=""
+CLEAR_SESSION=false
+COPY_FLAG=false
+PROMPT_TOKENS=0
+OUTPUT_TOKENS=0
+
+# =============================================================================
+#  DEPENDENCY CHECK  (runs before anything else, no colors yet)
+# =============================================================================
+check_deps() {
+    local missing=()
+    for cmd in curl jq sed awk tr; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "Error: missing required tools: ${missing[*]}"
+        echo ""
+        # Try to give a useful install hint
+        if command -v apt &>/dev/null; then
+            echo "  sudo apt install ${missing[*]}"
+        elif command -v dnf &>/dev/null; then
+            echo "  sudo dnf install ${missing[*]}"
+        elif command -v pacman &>/dev/null; then
+            echo "  sudo pacman -S ${missing[*]}"
+        elif command -v brew &>/dev/null; then
+            echo "  brew install ${missing[*]}"
+        fi
+        exit 1
+    fi
+
+    # Optional: warn about clipboard tools but don't fail
+    CLIP_CMD=""
+    if command -v xclip &>/dev/null; then
+        CLIP_CMD="xclip -selection clipboard"
+    elif command -v xsel &>/dev/null; then
+        CLIP_CMD="xsel --clipboard --input"
+    elif command -v wl-copy &>/dev/null; then
+        CLIP_CMD="wl-copy"
+    elif command -v pbcopy &>/dev/null; then
+        CLIP_CMD="pbcopy"
+    fi
+}
+
+# =============================================================================
+#  COLORS  (tput, reads from your terminal's theme)
+# =============================================================================
+setup_colors() {
+    # Respect NO_COLOR standard (https://no-color.org)
+    if [ -n "$NO_COLOR" ]; then
+        BOLD=""; ITALIC=""; DIM=""; RESET=""
+        COL_H1=""; COL_H2=""; COL_H3=""
+        COL_BULLET=""; COL_QUOTE=""; COL_CODE=""; COL_HR=""
+        COL_INFO=""; COL_WARN=""; COL_ERR=""; COL_OK=""
+        return
+    fi
+
+    if [ -t 1 ] && command -v tput &>/dev/null && tput colors &>/dev/null 2>&1 && [ "$(tput colors)" -ge 8 ]; then
+        BOLD=$(tput bold)
+        ITALIC=$(tput sitm 2>/dev/null || printf '')
+        DIM=$(tput dim)
+        RESET=$(tput sgr0)
+        COL_H1=$(tput bold; tput setaf 5)   # magenta
+        COL_H2=$(tput bold; tput setaf 4)   # blue
+        COL_H3=$(tput bold; tput setaf 6)   # cyan
+        COL_BULLET=$(tput setaf 3)           # yellow
+        COL_QUOTE=$(tput dim; tput setaf 7)  # dim white
+        COL_CODE=$(tput rev)                 # reverse — always readable
+        COL_HR=$(tput dim)
+        COL_INFO=$(tput setaf 6)
+        COL_WARN=$(tput setaf 3)
+        COL_ERR=$(tput bold; tput setaf 1)
+        COL_OK=$(tput setaf 2)
+    else
+        BOLD=""; ITALIC=""; DIM=""; RESET=""
+        COL_H1=""; COL_H2=""; COL_H3=""
+        COL_BULLET=""; COL_QUOTE=""; COL_CODE=""; COL_HR=""
+        COL_INFO=""; COL_WARN=""; COL_ERR=""; COL_OK=""
+    fi
+}
+
+# =============================================================================
+#  API KEY MANAGEMENT
+# =============================================================================
+load_api_key() {
+    # Priority 1: environment variable
+    if [ -n "$GEMINI_API_KEY" ]; then
+        API_KEY="$GEMINI_API_KEY"
+        return
+    fi
+
+    # Priority 2: key file — strip whitespace/newlines, read just the key
+    if [ -f "$KEY_FILE" ]; then
+        API_KEY=$(sed 's/[[:space:]]//g' "$KEY_FILE" | head -n1)
+        [ -n "$API_KEY" ] && return
+    fi
+
+    # Priority 3: prompt the user and save
+    echo ""
+    echo "${COL_WARN}${BOLD}No Gemini API key found.${RESET}"
+    echo ""
+    echo "  Get a free key at: ${COL_INFO}https://aistudio.google.com/app/apikey${RESET}"
+    echo ""
+    printf "Paste your API key: "
+    read -r input_key </dev/tty
+
+    if [ -z "$input_key" ]; then
+        echo "${COL_ERR}No key entered. Exiting.${RESET}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$KEY_FILE")"
+    # Use printf so no trailing newline is added — keeps the file clean
+    printf '%s' "$input_key" > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    API_KEY="$input_key"
+    echo "${COL_OK}✓ Key saved to $KEY_FILE${RESET}"
+    echo ""
+}
+
+# =============================================================================
+#  CONFIG  (~/.config/gemini/config)
+#  Simple KEY=VALUE format, # comments supported
+# =============================================================================
+load_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='=' read -r key val; do
+            # skip comments and blank lines
+            case "$key" in "#"*|"") continue ;; esac
+            key=$(echo "$key" | tr -d '[:space:]')
+            val=$(echo "$val" | tr -d '[:space:]')
+            case "$key" in
+                model)   [ -z "$MODEL" ]              && MODEL="$val"   ;;
+                session) [ "$SESSION" = "default" ]   && SESSION="$val" ;;
+            esac
+        done < "$CONFIG_FILE"
+    fi
+    [ -z "$MODEL" ] && MODEL="$MODEL_DEFAULT"
+}
+
+save_config_value() {
+    local target_key="$1"
+    local target_val="$2"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    local tmp
+    tmp=$(mktemp)
+    local found=false
+
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS='=' read -r key val; do
+            k=$(echo "$key" | tr -d '[:space:]')
+            if [ "$k" = "$target_key" ]; then
+                echo "${target_key}=${target_val}" >> "$tmp"
+                found=true
+            else
+                echo "${key}=${val}" >> "$tmp"
+            fi
+        done < "$CONFIG_FILE"
+    fi
+
+    $found || echo "${target_key}=${target_val}" >> "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# =============================================================================
+#  SESSION MANAGEMENT
+#  Sessions are stored as numbered+named files, e.g.:
+#    001_default.json
+#    002_work.json
+#  An index file maps session number → name for quick lookup.
+# =============================================================================
+
+# Pad a number to 3 digits: 1 → 001
+pad_num() { printf '%03d' "$1"; }
+
+# Return the filepath for a session by name (creates numbering if new)
+session_file() {
+    local name="$1"
+    mkdir -p "$SESSIONS_DIR"
+
+    # Search for existing file matching this name
+    local match
+    match=$(find "$SESSIONS_DIR" -maxdepth 1 -name "*_${name}.json" 2>/dev/null | sort | head -n1)
+    if [ -n "$match" ]; then
+        echo "$match"
+        return
+    fi
+
+    # New session — assign next number
+    local last_num=0
+    if [ -f "$SESSIONS_INDEX" ]; then
+        last_num=$(tail -n1 "$SESSIONS_INDEX" 2>/dev/null | cut -d'=' -f1 | tr -d '[:space:]' | sed 's/^0*//')
+        [ -z "$last_num" ] && last_num=0
+    fi
+    local next_num=$(( last_num + 1 ))
+    local padded
+    padded=$(pad_num "$next_num")
+    local new_file="$SESSIONS_DIR/${padded}_${name}.json"
+    echo "[]" > "$new_file"
+    echo "${padded}=${name}" >> "$SESSIONS_INDEX"
+    echo "$new_file"
+}
+
+# Resolve a session reference: can be a name or a number
+resolve_session() {
+    local ref="$1"
+
+    # If it's a number, look it up in the index
+    if [[ "$ref" =~ ^[0-9]+$ ]]; then
+        local padded
+        padded=$(pad_num "$ref")
+        if [ -f "$SESSIONS_INDEX" ]; then
+            local name
+            name=$(grep "^${padded}=" "$SESSIONS_INDEX" 2>/dev/null | cut -d'=' -f2)
+            if [ -n "$name" ]; then
+                echo "$name"
+                return
+            fi
+        fi
+        echo "${COL_ERR}No session with number $ref found.${RESET}" >&2
+        exit 1
+    fi
+
+    # Otherwise treat as a name directly
+    echo "$ref"
+}
+
+init_session() {
+    # Calling session_file creates the file if needed
+    SESSION_PATH=$(session_file "$SESSION")
+}
+
+clear_session() {
+    local sf
+    sf=$(session_file "$SESSION")
+    echo "[]" > "$sf"
+    echo "${COL_OK}✓ Session '$SESSION' cleared.${RESET}"
+}
+
+list_sessions() {
+    mkdir -p "$SESSIONS_DIR"
+    local files
+    files=$(find "$SESSIONS_DIR" -maxdepth 1 -name "*.json" 2>/dev/null | sort)
+
+    if [ -z "$files" ]; then
+        echo "No sessions found."
+        return
+    fi
+
+    echo "${BOLD}Sessions:${RESET}"
+    echo ""
+    printf "  ${DIM}%-6s %-20s %-8s %s${RESET}\n" "NUM" "NAME" "TURNS" "LAST MODIFIED"
+    printf "  ${DIM}%-6s %-20s %-8s %s${RESET}\n" "───" "────────────────────" "─────" "─────────────"
+
+    while IFS= read -r f; do
+        local base
+        base=$(basename "$f" .json)
+        local num="${base%%_*}"
+        local name="${base#*_}"
+        local count
+        count=$(jq 'length' "$f" 2>/dev/null || echo 0)
+        local turns=$(( count / 2 ))
+        local modified
+        modified=$(date -r "$f" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "unknown")
+        local marker=""
+        [ "$name" = "$SESSION" ] && marker=" ${COL_OK}←${RESET}"
+        printf "  ${COL_BULLET}%-6s${RESET} %-20s ${DIM}%-8s${RESET} ${DIM}%s${RESET}%s\n" \
+            "$num" "$name" "${turns}t" "$modified" "$marker"
+    done <<< "$files"
+    echo ""
+}
+
+delete_session() {
+    local ref="$1"
+    local name
+    name=$(resolve_session "$ref")
+    local sf
+    sf=$(session_file "$name")
+
+    if [ -f "$sf" ]; then
+        rm -f "$sf"
+        # Remove from index
+        if [ -f "$SESSIONS_INDEX" ]; then
+            local tmp
+            tmp=$(mktemp)
+            grep -v "=${name}$" "$SESSIONS_INDEX" > "$tmp" && mv "$tmp" "$SESSIONS_INDEX"
+        fi
+        echo "${COL_OK}✓ Session '$name' deleted.${RESET}"
+    else
+        echo "${COL_ERR}Session '$name' not found.${RESET}"
+    fi
+}
+
+rename_session() {
+    local ref="$1"
+    local new_name="$2"
+    local old_name
+    old_name=$(resolve_session "$ref")
+    local old_file
+    old_file=$(session_file "$old_name")
+
+    if [ ! -f "$old_file" ]; then
+        echo "${COL_ERR}Session '$old_name' not found.${RESET}"
+        exit 1
+    fi
+
+    local base
+    base=$(basename "$old_file" .json)
+    local num="${base%%_*}"
+    local new_file="$SESSIONS_DIR/${num}_${new_name}.json"
+
+    mv "$old_file" "$new_file"
+
+    # Update index
+    if [ -f "$SESSIONS_INDEX" ]; then
+        local tmp
+        tmp=$(mktemp)
+        sed "s/^${num}=.*/${num}=${new_name}/" "$SESSIONS_INDEX" > "$tmp" && mv "$tmp" "$SESSIONS_INDEX"
+    fi
+
+    echo "${COL_OK}✓ Session '$old_name' renamed to '$new_name'.${RESET}"
+}
+
+# =============================================================================
+#  MARKDOWN RENDERER  (pure sed + awk — zero extra dependencies)
+# =============================================================================
+render_markdown() {
+    local text="$1"
+    # awk handles fenced code blocks (```), sed handles inline elements
+    printf '%s\n' "$text" | awk \
+        -v cs="${COL_CODE}" \
+        -v dim="${DIM}" \
+        -v reset="${RESET}" \
+    '
+        /^```/ {
+            in_code = !in_code
+            print dim "  ───────────────────────────────" reset
+            next
+        }
+        in_code { print cs "  " $0 "  " reset; next }
+        { print }
+    ' | sed \
+        -e "s/\*\*\([^*]*\)\*\*/${BOLD}\1${RESET}/g" \
+        -e "s/__\([^_]*\)__/${BOLD}\1${RESET}/g" \
+        -e "s/\*\([^*][^*]*\)\*/${ITALIC}\1${RESET}/g" \
+        -e "s/_\([^_][^_]*\)_/${ITALIC}\1${RESET}/g" \
+        -e "s/^#### \(.*\)/${COL_H3}▸ \1${RESET}/" \
+        -e "s/^### \(.*\)/${COL_H3}\1${RESET}/" \
+        -e "s/^## \(.*\)/${COL_H2}\1${RESET}/" \
+        -e "s/^# \(.*\)/${COL_H1}\1${RESET}/" \
+        -e "s/^> \(.*\)/${COL_QUOTE}│ \1${RESET}/" \
+        -e "s/^---*$/${COL_HR}────────────────────────────────────${RESET}/" \
+        -e "s/^[[:space:]]*- /  ${COL_BULLET}•${RESET} /g" \
+        -e "s/^[[:space:]]*\* /  ${COL_BULLET}•${RESET} /g" \
+        -e "s/^[[:space:]]*[0-9]\+\. \(.*\)/  ${COL_BULLET}&${RESET}/g" \
+        -e "s/\`\([^\`]*\)\`/${COL_CODE} \1 ${RESET}/g"
+}
+
+# =============================================================================
+#  STREAMING API CALL
+# =============================================================================
+call_api_streaming() {
+    local sf="$SESSION_PATH"
+
+    # Build payload — optionally include system instruction
+    local payload
+    if [ -n "$SYSTEM_PROMPT" ]; then
+        payload=$(jq -n \
+            --slurpfile hist "$sf" \
+            --arg sp "$SYSTEM_PROMPT" \
+            '{system_instruction: {parts: [{text: $sp}]}, contents: $hist[0]}')
+    else
+        payload=$(jq -n --slurpfile hist "$sf" '{contents: $hist[0]}')
+    fi
+
+    local url="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse&key=${API_KEY}"
+
+    local full_response=""
+    local buffer=""
+    local had_error=false
+
+    # curl -N = no buffering, streams chunks as they arrive
+    while IFS= read -r line; do
+        [[ "$line" != data:* ]] && continue
+
+        local json="${line#data: }"
+        [[ "$json" == "[DONE]" ]] && break
+
+        # Check for API-level error in the chunk
+        local err
+        err=$(printf '%s' "$json" | jq -r '.error.message // empty' 2>/dev/null)
+        if [ -n "$err" ]; then
+            echo ""
+            echo "${COL_ERR}API Error: $err${RESET}"
+            had_error=true
+            break
+        fi
+
+        # Extract text chunk
+        local chunk
+        chunk=$(printf '%s' "$json" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null)
+
+        if [ -n "$chunk" ]; then
+            full_response+="$chunk"
+
+            if [ "$RAW" = true ]; then
+                printf '%s' "$chunk"
+            else
+                # Buffer until we have complete lines to avoid broken ANSI codes
+                buffer+="$chunk"
+                # Print all but the last (potentially incomplete) line
+                local complete_lines
+                complete_lines=$(printf '%s' "$buffer" | head -n -1)
+                if [ -n "$complete_lines" ]; then
+                    render_markdown "$complete_lines"
+                fi
+                buffer=$(printf '%s' "$buffer" | tail -n 1)
+            fi
+        fi
+
+        # Capture token usage metadata (comes in the last chunk)
+        local usage
+        usage=$(printf '%s' "$json" | jq -r '.usageMetadata // empty' 2>/dev/null)
+        if [ -n "$usage" ]; then
+            PROMPT_TOKENS=$(printf '%s' "$usage" | jq -r '.promptTokenCount // 0')
+            OUTPUT_TOKENS=$(printf '%s' "$usage" | jq -r '.candidatesTokenCount // 0')
+        fi
+
+    done < <(curl -sN "$url" \
+        -H 'Content-Type: application/json' \
+        -X POST \
+        -d "$payload" \
+        --max-time 120 \
+        2>/dev/null)
+
+    # Flush remaining buffer
+    if [ -n "$buffer" ]; then
+        [ "$RAW" = true ] && printf '%s' "$buffer" || render_markdown "$buffer"
+    fi
+
+    printf '\n'
+
+    # Footer: token count + model
+    if [ "$RAW" = false ] && [ "$had_error" = false ]; then
+        printf "${DIM}[↑ %s tokens  ↓ %s tokens  •  %s]${RESET}\n" \
+            "$PROMPT_TOKENS" "$OUTPUT_TOKENS" "$MODEL"
+    fi
+
+    # Copy to clipboard if --copy was passed
+    if [ "$COPY_FLAG" = true ] && [ -n "$full_response" ]; then
+        if [ -n "$CLIP_CMD" ]; then
+            printf '%s' "$full_response" | $CLIP_CMD
+            echo "${COL_OK}✓ Response copied to clipboard.${RESET}"
+        else
+            echo "${COL_WARN}--copy: no clipboard tool found (install xclip, xsel, or wl-copy).${RESET}"
+        fi
+    fi
+
+    # Save model turn to history
+    if [ -n "$full_response" ] && [ "$had_error" = false ]; then
+        jq --arg ans "$full_response" \
+            '. + [{"role": "model", "parts": [{"text": $ans}]}]' \
+            "$sf" > "${sf}.tmp" && mv "${sf}.tmp" "$sf"
+    fi
+}
+
+# =============================================================================
+#  SELF-UPDATE
+# =============================================================================
+do_update() {
+    echo "${COL_INFO}Checking for updates from ${REPO}…${RESET}"
+
+    local tmp
+    tmp=$(mktemp)
+    local http_code
+    http_code=$(curl -sL -w "%{http_code}" -o "$tmp" "$RAW_URL")
+
+    if [ "$http_code" != "200" ]; then
+        echo "${COL_ERR}Update failed (HTTP $http_code). Check your REPO setting in the script.${RESET}"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    local remote_version
+    remote_version=$(grep '^VERSION=' "$tmp" | head -n1 | cut -d'"' -f2)
+
+    if [ "$remote_version" = "$VERSION" ]; then
+        echo "${COL_OK}Already up to date (v${VERSION}).${RESET}"
+        rm -f "$tmp"
+        exit 0
+    fi
+
+    echo "  Current: ${COL_WARN}v${VERSION}${RESET}"
+    echo "  Latest:  ${COL_OK}v${remote_version}${RESET}"
+    echo ""
+    printf "Update now? [y/N] "
+    read -r confirm </dev/tty
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        local self
+        self=$(realpath "$0")
+        chmod +x "$tmp"
+        mv "$tmp" "$self"
+        echo "${COL_OK}✓ Updated to v${remote_version}. Restart your shell if needed.${RESET}"
+    else
+        echo "Update cancelled."
+        rm -f "$tmp"
+    fi
+}
+
+# =============================================================================
+#  HELP
+# =============================================================================
+show_help() {
+    cat <<EOF
+${BOLD}gemini${RESET} v${VERSION} — Gemini AI in your terminal
+
+${BOLD}USAGE${RESET}
+  gemini [flags] "your prompt"
+  echo "context" | gemini [flags] "your prompt"
+  cat file.txt  | gemini "summarize this"
+
+${BOLD}FLAGS${RESET}
+  --model <name>             Use a specific model (persists to config)
+  --session <name|number>    Use a named or numbered session
+  --system <text>            Set a system instruction for this call
+  --new                      Clear current session history
+  --list-sessions            List all saved sessions
+  --delete-session <name|#>  Delete a session
+  --rename-session <name|#> <new-name>
+  --copy                     Copy response to clipboard
+  --update                   Update gemini to the latest version
+  --raw                      Print raw markdown (no rendering)
+  --version                  Show version
+  --help                     Show this help
+
+${BOLD}MODELS${RESET}
+  — Gemini 3 series (preview) —
+  gemini-3.1-pro-preview      Most capable, complex reasoning & coding
+  gemini-3-flash-preview      Frontier-class, fast & cost-efficient
+  gemini-3.1-flash-lite-preview  Fastest Gemini 3, lowest cost
+
+  — Gemini 2.5 series (stable) —
+  gemini-2.5-pro              Best reasoning, 1M context ${DIM}(powerful)${RESET}
+  gemini-2.5-flash            Best price/performance ${DIM}(default)${RESET}
+  gemini-2.5-flash-lite       Fastest & cheapest of 2.5
+
+${BOLD}API KEY${RESET}
+  Auto-prompted on first run and saved to ${COL_INFO}~/.config/gemini/api_key${RESET}
+  Or set:  export GEMINI_API_KEY="your-key"
+
+${BOLD}EXAMPLES${RESET}
+  gemini "explain docker networking"
+  gemini --model gemini-3.1-pro-preview "write a regex for emails"
+  gemini --session 2 "continue from last time"
+  gemini --session work "what did we discuss?"
+  gemini --system "you are a bash expert" "parse a CSV in bash"
+  cat error.log | gemini "what is causing this?"
+  gemini --copy "give me a one-liner to find large files"
+  gemini --new "fresh start"
+  gemini --list-sessions
+  gemini --update
+EOF
+}
+
+# =============================================================================
+#  ENTRY POINT
+# =============================================================================
+check_deps
+setup_colors
+load_config
+
+# --- Parse flags -------------------------------------------------------------
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            show_help; exit 0 ;;
+        --version|-v)
+            echo "gemini v${VERSION}"; exit 0 ;;
+        --raw)
+            RAW=true; shift ;;
+        --copy)
+            COPY_FLAG=true; shift ;;
+        --new)
+            CLEAR_SESSION=true; shift ;;
+        --update)
+            do_update; exit 0 ;;
+        --model)
+            MODEL="$2"; shift 2
+            save_config_value "model" "$MODEL"
+            echo "${COL_OK}✓ Model set to '${MODEL}' (saved).${RESET}"
+            ;;
+        --session)
+            SESSION=$(resolve_session "$2"); shift 2 ;;
+        --system)
+            SYSTEM_PROMPT="$2"; shift 2 ;;
+        --list-sessions)
+            # Colors not yet set at check_deps time, but are now
+            list_sessions; exit 0 ;;
+        --delete-session)
+            delete_session "$2"; exit 0 ;;
+        --rename-session)
+            rename_session "$2" "$3"; exit 0 ;;
+        --)
+            shift; ARGS+=("$@"); break ;;
+        -*)
+            echo "${COL_ERR}Unknown flag: $1${RESET}  (try --help)"; exit 1 ;;
+        *)
+            ARGS+=("$1"); shift ;;
+    esac
+done
+
+load_api_key
+init_session
+
+# --new clears history then continues (or exits if no prompt)
+if [ "$CLEAR_SESSION" = true ]; then
+    clear_session
+    [ ${#ARGS[@]} -eq 0 ] && exit 0
+fi
+
+# --- Stdin -------------------------------------------------------------------
+if [ ! -t 0 ]; then
+    STDIN_CONTENT=$(cat)
+fi
+
+# --- Build prompt ------------------------------------------------------------
+PROMPT="${ARGS[*]}"
+
+if [ -z "$PROMPT" ] && [ -z "$STDIN_CONTENT" ]; then
+    show_help; exit 0
+fi
+
+# Combine stdin + prompt
+if [ -n "$STDIN_CONTENT" ] && [ -n "$PROMPT" ]; then
+    PROMPT="${PROMPT}
+
+---
+${STDIN_CONTENT}"
+elif [ -n "$STDIN_CONTENT" ]; then
+    PROMPT="$STDIN_CONTENT"
+fi
+
+# --- Append user turn to history --------------------------------------------
+jq --arg msg "$PROMPT" \
+    '. + [{"role": "user", "parts": [{"text": $msg}]}]' \
+    "$SESSION_PATH" > "${SESSION_PATH}.tmp" \
+    && mv "${SESSION_PATH}.tmp" "$SESSION_PATH"
+
+# --- Fire -------------------------------------------------------------------
+call_api_streaming
