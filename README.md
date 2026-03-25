@@ -1,4 +1,4 @@
-# gemini-cli
+# gemini_cli
 
 A fast, feature-rich Gemini AI client for macOS/linux written in bash
 
