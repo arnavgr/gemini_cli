@@ -7,7 +7,7 @@
 #    bash install.sh --uninstall          # remove it
 # =============================================================================
 
-REPO="arnavgr/gemini_cli"
+REPO="arnavgr/gemini-cli" # Fixed: hyphen instead of underscore
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main/gemini"
 BINARY_NAME="gemini"
 DEFAULT_PREFIX="/usr/local"
@@ -57,30 +57,6 @@ echo ""
 echo "${BOLD}gemini CLI installer${R}"
 echo "────────────────────"
 echo ""
-
-# --- Dependency check --------------------------------------------------------
-print_info "Checking dependencies…"
-missing=()
-for cmd in curl jq sed awk; do
-    command -v "$cmd" &>/dev/null || missing+=("$cmd")
-done
-
-if [ ${#missing[@]} -gt 0 ]; then
-    print_err "Missing required tools: ${missing[*]}"
-    echo ""
-    if command -v apt &>/dev/null; then
-        echo "  Run: sudo apt install ${missing[*]}"
-    elif command -v dnf &>/dev/null; then
-        echo "  Run: sudo dnf install ${missing[*]}"
-    elif command -v pacman &>/dev/null; then
-        echo "  Run: sudo pacman -S ${missing[*]}"
-    elif command -v brew &>/dev/null; then
-        echo "  Run: brew install ${missing[*]}"
-    fi
-    echo ""
-    exit 1
-fi
-print_ok "All dependencies found."
 
 # --- Create install dir if needed --------------------------------------------
 if [ ! -d "$INSTALL_DIR" ]; then
