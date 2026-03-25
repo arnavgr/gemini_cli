@@ -7,7 +7,7 @@
 #    bash install.sh --uninstall          # remove it
 # =============================================================================
 
-REPO="arnavgr/gemini-cli" # Fixed: hyphen instead of underscore
+REPO="arnavgr/gemini_cli"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/main/gemini"
 BINARY_NAME="gemini"
 DEFAULT_PREFIX="/usr/local"
@@ -54,7 +54,7 @@ fi
 #  INSTALL
 # =============================================================================
 echo ""
-echo "${BOLD}gemini CLI installer${R}"
+echo -e "${BOLD}gemini CLI installer${R}"
 echo "────────────────────"
 echo ""
 
@@ -120,8 +120,8 @@ fi
 
 # --- Done --------------------------------------------------------------------
 echo ""
-echo "${BOLD}All done!${R} Run ${INFO}gemini --help${R} to get started."
+echo -e "  ${BOLD}All done!${R} Run ${INFO}gemini --help${R} to get started."
 echo ""
 echo "  On first run you'll be prompted for your Gemini API key."
-echo "  Get one free at: ${INFO}https://aistudio.google.com/app/apikey${R}"
+echo -e "  Get one free at: ${INFO}https://aistudio.google.com/app/apikey${R}"
 echo ""
